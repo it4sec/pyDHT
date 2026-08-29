@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+
+# Virtual env
+.venv/
+.env/
+
+# Secrets
+.env
+*.env
+
+# Logs
+logs/
+*.log
+
+# Data
+db/*
+
+# Tests & Packages
+_research/
+
+# Config
+git.sh
