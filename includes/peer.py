@@ -28,15 +28,22 @@ LOCAL_UT_METADATA_ID = 1
 
 
 class PeerError(RuntimeError):
-    pass
+    """Expected remote peer/network failure normalized at the peer boundary."""
+
+    def __init__(self, message: str, *, category: str = "peer_error", stage: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.stage = stage
 
 
 class MetadataRejected(PeerError):
-    pass
+    def __init__(self, message: str):
+        super().__init__(message, category="metadata_rejected", stage="metadata")
 
 
 class MetadataHashMismatch(PeerError):
-    pass
+    def __init__(self, message: str):
+        super().__init__(message, category="metadata_hash_mismatch", stage="metadata")
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,15 +95,15 @@ def build_handshake(info_hash: bytes, peer_id: bytes) -> bytes:
 
 def parse_handshake(data: bytes, expected_info_hash: bytes) -> PeerHandshake:
     if len(data) != BT_HANDSHAKE_BYTES:
-        raise PeerError("invalid BitTorrent handshake length")
+        raise PeerError("invalid BitTorrent handshake length", category="handshake_invalid", stage="bt_handshake")
     pstrlen = data[0]
     if pstrlen != len(BT_PROTOCOL) or data[1:20] != BT_PROTOCOL:
-        raise PeerError("unexpected BitTorrent protocol identifier")
+        raise PeerError("unexpected BitTorrent protocol identifier", category="handshake_invalid", stage="bt_handshake")
     reserved = data[20:28]
     info_hash = data[28:48]
     peer_id = data[48:68]
     if info_hash != expected_info_hash:
-        raise PeerError("wire infohash mismatch")
+        raise PeerError("wire infohash mismatch", category="handshake_invalid", stage="bt_handshake")
     return PeerHandshake(BT_PROTOCOL, reserved, info_hash, peer_id)
 
 
@@ -114,14 +121,26 @@ def _compact_ip(value: Any) -> str | None:
 
 
 def parse_extension_handshake(payload: bytes) -> ExtensionHandshake:
-    value = bencode.decode(
-        payload,
-        max_depth=config.MAX_BENCODE_DEPTH,
-        max_items=config.MAX_BENCODE_ITEMS,
-        max_string_length=config.MAX_BENCODE_STRING_LENGTH,
-    )
+    try:
+        value = bencode.decode(
+            payload,
+            max_depth=config.MAX_BENCODE_DEPTH,
+            max_items=config.MAX_BENCODE_ITEMS,
+            max_string_length=config.MAX_BENCODE_STRING_LENGTH,
+            require_sorted_keys=False,
+        )
+    except bencode.BencodeError as exc:
+        raise PeerError(
+            "invalid BEP-10 extension handshake bencode",
+            category="extension_handshake_invalid",
+            stage="extension_handshake",
+        ) from exc
     if not isinstance(value, dict):
-        raise PeerError("BEP-10 handshake must be a dictionary")
+        raise PeerError(
+            "BEP-10 handshake must be a dictionary",
+            category="extension_handshake_invalid",
+            stage="extension_handshake",
+        )
     raw_mapping = value.get(b"m", {})
     mapping: dict[bytes, int] = {}
     if isinstance(raw_mapping, dict):
@@ -133,7 +152,11 @@ def parse_extension_handshake(payload: bytes) -> ExtensionHandshake:
         ut_id = None
     size = value.get(b"metadata_size")
     if size is not None and (not isinstance(size, int) or size <= 0 or size > config.MAX_METADATA_SIZE):
-        raise PeerError("invalid or excessive metadata_size")
+        raise PeerError(
+            "invalid or excessive metadata_size",
+            category="extension_handshake_invalid",
+            stage="extension_handshake",
+        )
     port = value.get(b"p")
     if port is not None and (not isinstance(port, int) or not (1 <= port <= 65535)):
         port = None
@@ -176,29 +199,38 @@ def build_metadata_reject(extension_id: int, piece: int) -> bytes:
 
 
 def parse_metadata_message(payload: bytes, *, metadata_size: int, expected_piece_count: int) -> tuple[dict[bytes, Any], bytes]:
-    header, consumed = bencode.decode_prefix(
-        payload,
-        max_depth=config.MAX_BENCODE_DEPTH,
-        max_items=config.MAX_BENCODE_ITEMS,
-        max_string_length=config.MAX_BENCODE_STRING_LENGTH,
-    )
+    try:
+        header, consumed = bencode.decode_prefix(
+            payload,
+            max_depth=config.MAX_BENCODE_DEPTH,
+            max_items=config.MAX_BENCODE_ITEMS,
+            max_string_length=config.MAX_BENCODE_STRING_LENGTH,
+            require_sorted_keys=False,
+        )
+    except bencode.BencodeError as exc:
+        raise PeerError(
+            "invalid BEP-9 metadata message bencode",
+            category="metadata_invalid",
+            stage="metadata",
+        ) from exc
     if not isinstance(header, dict):
-        raise PeerError("BEP-9 message header must be a dictionary")
+        raise PeerError("BEP-9 message header must be a dictionary", category="metadata_invalid", stage="metadata")
     msg_type = header.get(b"msg_type")
     piece = header.get(b"piece")
     if msg_type not in {0, 1, 2} or not isinstance(piece, int) or not (0 <= piece < expected_piece_count):
-        raise PeerError("invalid BEP-9 message type or piece")
+        raise PeerError("invalid BEP-9 message type or piece", category="metadata_invalid", stage="metadata")
     trailing = payload[consumed:]
     if msg_type == 1:
         total_size = header.get(b"total_size")
         if total_size != metadata_size:
-            raise PeerError("BEP-9 total_size inconsistent with metadata_size")
+            raise PeerError("BEP-9 total_size inconsistent with metadata_size", category="metadata_invalid", stage="metadata")
         expected_size = min(BEP9_BLOCK_SIZE, metadata_size - piece * BEP9_BLOCK_SIZE)
         if len(trailing) != expected_size:
-            raise PeerError("invalid BEP-9 piece size")
+            raise PeerError("invalid BEP-9 piece size", category="metadata_invalid", stage="metadata")
     elif trailing:
-        raise PeerError("unexpected payload on BEP-9 request/reject")
+        raise PeerError("unexpected payload on BEP-9 request/reject", category="metadata_invalid", stage="metadata")
     return header, trailing
+
 
 
 class PeerClient:
@@ -219,15 +251,40 @@ class PeerClient:
             try:
                 async with asyncio.timeout(config.PEER_SESSION_TIMEOUT):
                     return await self._fetch(session_id, endpoint, info_hash, dht_key)
-            except TimeoutError as exc:
-                self._failure(session_id, endpoint, dht_key, "session_timeout")
-                raise PeerError("peer session deadline exceeded") from exc
-            except (OSError, asyncio.IncompleteReadError, PeerError) as exc:
-                self._failure(session_id, endpoint, dht_key, type(exc).__name__, str(exc))
+            except asyncio.CancelledError:
                 raise
+            except TimeoutError as exc:
+                normalized = PeerError(
+                    "peer session deadline exceeded",
+                    category="session_timeout",
+                    stage="session",
+                )
+                self._failure(session_id, endpoint, dht_key, normalized.category, str(normalized), normalized.stage)
+                raise normalized from exc
+            except PeerError as exc:
+                self._failure(session_id, endpoint, dht_key, exc.category, str(exc), exc.stage)
+                raise
+            except bencode.BencodeError as exc:
+                normalized = PeerError(
+                    "malformed peer bencode",
+                    category="protocol_invalid",
+                    stage="session",
+                )
+                self._failure(session_id, endpoint, dht_key, normalized.category, str(normalized), normalized.stage)
+                raise normalized from exc
+            except (asyncio.IncompleteReadError, OSError, ConnectionError, BrokenPipeError) as exc:
+                normalized = PeerError(
+                    "peer connection closed or failed",
+                    category="peer_io_error",
+                    stage="session",
+                )
+                self._failure(session_id, endpoint, dht_key, normalized.category, str(exc), normalized.stage)
+                raise normalized from exc
 
     async def _fetch(self, session_id: str, endpoint: tuple[str, int], info_hash: bytes, dht_key: str) -> MetadataResult:
         started = time.monotonic_ns()
+        stage = "connect"
+        writer: asyncio.StreamWriter | None = None
         try:
             peer_ip = ipaddress.ip_address(endpoint[0])
             family = socket.AF_INET if peer_ip.version == 4 else socket.AF_INET6
@@ -235,14 +292,16 @@ class PeerClient:
                 asyncio.open_connection(str(peer_ip), endpoint[1], family=family),
                 config.PEER_CONNECT_TIMEOUT,
             )
-        except asyncio.TimeoutError as exc:
-            raise PeerError("TCP connect timeout") from exc
-        connected = time.monotonic_ns()
-        local = writer.get_extra_info("sockname")
-        try:
+            connected = time.monotonic_ns()
+            local = writer.get_extra_info("sockname")
+
+            stage = "bt_handshake"
             writer.write(build_handshake(info_hash, self.peer_id))
             await writer.drain()
-            raw_handshake = await asyncio.wait_for(reader.readexactly(BT_HANDSHAKE_BYTES), config.PEER_HANDSHAKE_TIMEOUT)
+            raw_handshake = await asyncio.wait_for(
+                reader.readexactly(BT_HANDSHAKE_BYTES),
+                config.PEER_HANDSHAKE_TIMEOUT,
+            )
             handshake = parse_handshake(raw_handshake, info_hash)
             self.emit({
                 "record_type": "peer", "event": "peer_handshake", "peer_session_id": session_id, "peer_transport": "tcp",
@@ -253,18 +312,46 @@ class PeerClient:
                 "extension_protocol": handshake.extension_protocol,
             })
             if not handshake.extension_protocol:
-                raise PeerError("peer does not advertise BEP-10")
+                raise PeerError(
+                    "peer does not advertise BEP-10",
+                    category="extension_unsupported",
+                    stage="extension_handshake",
+                )
+
+            stage = "extension_handshake"
             writer.write(build_extended_handshake())
             await writer.drain()
-            ext = await self._wait_extension_handshake(reader, writer, session_id, endpoint, dht_key, handshake.dht_capability)
+            ext = await self._wait_extension_handshake(
+                reader, writer, session_id, endpoint, dht_key, handshake.dht_capability
+            )
             if ext.ut_metadata_id is None:
-                raise PeerError("peer does not advertise ut_metadata")
+                raise PeerError(
+                    "peer does not advertise ut_metadata",
+                    category="ut_metadata_unavailable",
+                    stage="extension_handshake",
+                )
             if ext.metadata_size is None:
-                raise PeerError("peer did not provide metadata_size")
+                raise PeerError(
+                    "peer did not provide metadata_size",
+                    category="extension_handshake_invalid",
+                    stage="extension_handshake",
+                )
+
+            stage = "metadata"
             transfer_start = time.monotonic_ns()
             raw_info = await asyncio.wait_for(
-                self._download_metadata(reader, writer, session_id, endpoint, dht_key, ext.ut_metadata_id, ext.metadata_size,
-                                        min(config.METADATA_REQUEST_PIPELINE, ext.reqq) if isinstance(ext.reqq, int) and ext.reqq > 0 else config.METADATA_REQUEST_PIPELINE),
+                self._download_metadata(
+                    reader,
+                    writer,
+                    session_id,
+                    endpoint,
+                    dht_key,
+                    ext.ut_metadata_id,
+                    ext.metadata_size,
+                    min(config.METADATA_REQUEST_PIPELINE, ext.reqq)
+                    if isinstance(ext.reqq, int) and ext.reqq > 0
+                    else config.METADATA_REQUEST_PIPELINE,
+                ),
                 config.METADATA_TIMEOUT,
             )
             transfer_end = time.monotonic_ns()
@@ -276,13 +363,53 @@ class PeerClient:
                 "torrent_uid": torrent_uid, "remote_ip": endpoint[0], "remote_port": endpoint[1], "metadata_size": len(raw_info),
                 "connect_ms": (connected - started) / 1e6, "transfer_ms": (transfer_end - transfer_start) / 1e6, "hash_valid": True,
             })
-            return MetadataResult(raw_info, session_id, endpoint, (connected - started) / 1e6, (transfer_end - transfer_start) / 1e6)
+            return MetadataResult(
+                raw_info,
+                session_id,
+                endpoint,
+                (connected - started) / 1e6,
+                (transfer_end - transfer_start) / 1e6,
+            )
+        except asyncio.CancelledError:
+            raise
+        except PeerError:
+            raise
+        except asyncio.TimeoutError as exc:
+            if stage == "connect":
+                category = "connect_timeout"
+                message = "TCP connect timeout"
+            elif stage in {"bt_handshake", "extension_handshake"}:
+                category = "handshake_timeout"
+                message = f"timeout during {stage}"
+            else:
+                category = "metadata_timeout"
+                message = "metadata exchange timeout"
+            raise PeerError(message, category=category, stage=stage) from exc
+        except asyncio.IncompleteReadError as exc:
+            raise PeerError(
+                f"peer disconnected during {stage}",
+                category="peer_disconnected",
+                stage=stage,
+            ) from exc
+        except (ConnectionError, BrokenPipeError, OSError) as exc:
+            if stage == "connect":
+                raise PeerError(
+                    "TCP connection failed",
+                    category="connect_failed",
+                    stage=stage,
+                ) from exc
+            raise PeerError(
+                f"peer connection failed during {stage}",
+                category="peer_disconnected",
+                stage=stage,
+            ) from exc
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
 
     async def _wait_extension_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_id: str,
                                         endpoint: tuple[str, int], dht_key: str, dht_capability: bool) -> ExtensionHandshake:
@@ -294,7 +421,7 @@ class PeerClient:
             if length == 0:
                 continue
             if length > config.MAX_PEER_MESSAGE_SIZE:
-                raise PeerError("peer message exceeds configured limit")
+                raise PeerError("peer message exceeds configured limit", category="extension_handshake_invalid", stage="extension_handshake")
             body = await asyncio.wait_for(reader.readexactly(length), timeout)
             msg_id = body[0]
             if msg_id == BT_PORT_MESSAGE_ID and length == 3 and dht_capability:
@@ -324,7 +451,7 @@ class PeerClient:
         piece_count = (metadata_size + BEP9_BLOCK_SIZE - 1) // BEP9_BLOCK_SIZE
         pipeline_limit = max(1, min(config.METADATA_REQUEST_PIPELINE, pipeline_limit or config.METADATA_REQUEST_PIPELINE))
         if piece_count <= 0 or metadata_size > config.MAX_METADATA_SIZE:
-            raise PeerError("invalid metadata size")
+            raise PeerError("invalid metadata size", category="metadata_invalid", stage="metadata")
         pieces: dict[int, bytes] = {}
         outstanding: set[int] = set()
         next_piece = 0
@@ -345,7 +472,7 @@ class PeerClient:
             if length == 0:
                 continue
             if length > config.MAX_PEER_MESSAGE_SIZE:
-                raise PeerError("peer message exceeds configured limit")
+                raise PeerError("peer message exceeds configured limit", category="metadata_invalid", stage="metadata")
             body = await reader.readexactly(length)
             msg_id = body[0]
             if msg_id == BT_PORT_MESSAGE_ID and length == 3:
@@ -363,7 +490,7 @@ class PeerClient:
                 if b"ut_metadata" in ext.mapping:
                     updated_id = ext.mapping[b"ut_metadata"]
                     if updated_id == 0:
-                        raise PeerError("peer disabled ut_metadata during metadata exchange")
+                        raise PeerError("peer disabled ut_metadata during metadata exchange", category="ut_metadata_unavailable", stage="metadata")
                     remote_ext_id = updated_id
                 continue
             if ext_id == LOCAL_UT_METADATA_ID:
@@ -383,10 +510,10 @@ class PeerClient:
                         raise MetadataRejected(f"peer rejected metadata piece {piece}")
                     continue
                 if piece not in outstanding and piece not in pieces:
-                    raise PeerError("unsolicited metadata piece")
+                    raise PeerError("unsolicited metadata piece", category="metadata_invalid", stage="metadata")
                 if piece in pieces:
                     if pieces[piece] != trailing:
-                        raise PeerError("conflicting duplicate metadata piece")
+                        raise PeerError("conflicting duplicate metadata piece", category="metadata_invalid", stage="metadata")
                     continue
                 pieces[piece] = trailing
                 outstanding.discard(piece)
@@ -394,7 +521,7 @@ class PeerClient:
             # Unknown extension IDs are ignored as required by BEP-9/BEP-10 extensibility.
         raw = b"".join(pieces[i] for i in range(piece_count))
         if len(raw) != metadata_size:
-            raise PeerError("assembled metadata length mismatch")
+            raise PeerError("assembled metadata length mismatch", category="metadata_invalid", stage="metadata")
         return raw
 
     def _emit_metadata_message(self, session_id: str, endpoint: tuple[str, int], dht_key: str, direction: str,
@@ -407,9 +534,19 @@ class PeerClient:
             "dht_key": dht_key, "remote_ip": endpoint[0], "remote_port": endpoint[1],
         })
 
-    def _failure(self, session_id: str, endpoint: tuple[str, int], dht_key: str, category: str, detail: str = "") -> None:
+    def _failure(
+        self,
+        session_id: str,
+        endpoint: tuple[str, int],
+        dht_key: str,
+        category: str,
+        detail: str = "",
+        stage: str | None = None,
+    ) -> None:
         self.emit({
             "record_type": "peer", "event": "metadata_failure", "peer_session_id": session_id, "dht_key": dht_key,
-            "remote_ip": endpoint[0], "remote_port": endpoint[1], "hash_valid": False if category == "MetadataHashMismatch" else None,
-            "failure_category": category, "detail": detail[: config.MAX_EVIDENCE_TEXT_LENGTH],
+            "remote_ip": endpoint[0], "remote_port": endpoint[1],
+            "hash_valid": False if category == "metadata_hash_mismatch" else None,
+            "failure_category": category, "failure_stage": stage,
+            "detail": detail[: config.MAX_EVIDENCE_TEXT_LENGTH],
         })

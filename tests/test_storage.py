@@ -49,6 +49,20 @@ class DatabaseStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.due_candidates(now, 10), [])
         self.assertEqual(await self.db.due_candidates(now + 11, 10), [key])
 
+    async def test_restart_recovers_interrupted_fetching_candidate(self):
+        key = "dht20:" + "05" * 20
+        now = time.time_ns()
+        await self.db.upsert_candidate_seen(key, now)
+        await self.db.mark_fetching(key, now)
+        await self.db.close()
+
+        self.db = DatabaseWorker(asyncio.get_running_loop())
+        self.db.start()
+        state = await self.db.candidate_state(key)
+        self.assertEqual(state["state"], "fetch_failed")
+        self.assertIsNotNone(state["next_attempt_at"])
+        self.assertEqual(await self.db.due_candidates(time.time_ns(), 10), [key])
+
     async def test_atomic_torrent_files_notification_candidate_completion(self):
         key = "dht20:" + "02" * 20
         uid = "btih:" + "02" * 20

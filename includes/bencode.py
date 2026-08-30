@@ -17,9 +17,10 @@ class DecodeLimits:
 
 
 class _Decoder:
-    def __init__(self, data: bytes, limits: DecodeLimits):
+    def __init__(self, data: bytes, limits: DecodeLimits, *, require_sorted_keys: bool):
         self.data = data
         self.limits = limits
+        self.require_sorted_keys = require_sorted_keys
         self.items = 0
 
     def _count(self) -> None:
@@ -57,7 +58,9 @@ class _Decoder:
                     return out, pos + 1
                 self._count()
                 key, pos = self._parse_bytes(pos)
-                if previous is not None and key <= previous:
+                if key in out:
+                    raise BencodeError("duplicate dictionary key")
+                if self.require_sorted_keys and previous is not None and key < previous:
                     raise BencodeError("dictionary keys must be strictly sorted")
                 previous = key
                 value, pos = self.parse(pos, depth + 1)
@@ -104,17 +107,46 @@ class _Decoder:
         return self.data[start:end], end
 
 
-def decode_prefix(data: bytes, *, max_depth: int, max_items: int, max_string_length: int) -> tuple[Any, int]:
-    """Decode one bencode value and return ``(value, consumed_bytes)``."""
+def decode_prefix(
+    data: bytes,
+    *,
+    max_depth: int,
+    max_items: int,
+    max_string_length: int,
+    require_sorted_keys: bool = True,
+) -> tuple[Any, int]:
+    """Decode one bencode value and return ``(value, consumed_bytes)``.
+
+    Dictionary ordering is strict by default. ``require_sorted_keys=False`` is
+    reserved for narrowly scoped interoperability parsing of remote peer-control
+    messages; duplicate keys and all structural/resource limits remain enforced.
+    """
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("data must be bytes-like")
-    decoder = _Decoder(bytes(data), DecodeLimits(max_depth, max_items, max_string_length))
+    decoder = _Decoder(
+        bytes(data),
+        DecodeLimits(max_depth, max_items, max_string_length),
+        require_sorted_keys=require_sorted_keys,
+    )
     return decoder.parse()
 
 
-def decode(data: bytes, *, max_depth: int, max_items: int, max_string_length: int) -> Any:
+def decode(
+    data: bytes,
+    *,
+    max_depth: int,
+    max_items: int,
+    max_string_length: int,
+    require_sorted_keys: bool = True,
+) -> Any:
     """Decode exactly one bencode value, rejecting trailing data."""
-    value, consumed = decode_prefix(data, max_depth=max_depth, max_items=max_items, max_string_length=max_string_length)
+    value, consumed = decode_prefix(
+        data,
+        max_depth=max_depth,
+        max_items=max_items,
+        max_string_length=max_string_length,
+        require_sorted_keys=require_sorted_keys,
+    )
     if consumed != len(data):
         raise BencodeError("trailing data after bencode value")
     return value

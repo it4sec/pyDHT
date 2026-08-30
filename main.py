@@ -86,8 +86,12 @@ async def _process_candidate(worker_id: int, key: bytes, candidates: CandidateMa
         tried.add(endpoint)
         try:
             result = await peer_client.fetch_metadata(endpoint, key)
-        except (PeerError, OSError) as exc:
-            errors.append(f"{ip}:{port} {type(exc).__name__}: {exc}")
+        except PeerError as exc:
+            errors.append(f"{ip}:{port} {exc.category}: {exc}")
+            LOG.debug(
+                "candidate %s peer %s:%d failed category=%s stage=%s detail=%s",
+                key_text, ip, port, exc.category, exc.stage, exc,
+            )
             continue
         raw_info = result.raw_info
         break
@@ -115,8 +119,12 @@ async def _process_candidate(worker_id: int, key: bytes, candidates: CandidateMa
         attempts += 1
         try:
             result = await peer_client.fetch_metadata(endpoint, key)
-        except (PeerError, OSError) as exc:
-            errors.append(f"{endpoint[0]}:{endpoint[1]} {type(exc).__name__}: {exc}")
+        except PeerError as exc:
+            errors.append(f"{endpoint[0]}:{endpoint[1]} {exc.category}: {exc}")
+            LOG.debug(
+                "candidate %s peer %s:%d failed category=%s stage=%s detail=%s",
+                key_text, endpoint[0], endpoint[1], exc.category, exc.stage, exc,
+            )
             continue
         raw_info = result.raw_info
         break
@@ -143,10 +151,12 @@ async def _process_candidate(worker_id: int, key: bytes, candidates: CandidateMa
     error_text = "; ".join(errors[-8:]) or "no usable metadata peer found"
     if attempt_no >= config.FETCH_RETRY_MAX_ATTEMPTS:
         await db.mark_fetch_failed(key_text, error_text, time.time_ns(), None)
+        LOG.debug("candidate %s exhausted metadata retries: %s", key_text, error_text)
     else:
         delay = _retry_delay(attempt_no, config.FETCH_RETRY_BASE_SECONDS, config.FETCH_RETRY_MAX_SECONDS)
         now = time.time_ns()
         await db.mark_fetch_failed(key_text, error_text, now, now + delay * 1_000_000_000)
+        LOG.debug("candidate %s scheduled for retry in %ds: %s", key_text, delay, error_text)
     candidates.finish(key, recent=True)
 
 

@@ -45,6 +45,26 @@ class BencodeTests(unittest.TestCase):
         with self.assertRaises(bencode.BencodeError):
             bencode.decode(b"d1:bi1e1:ai2ee", max_depth=5, max_items=20, max_string_length=10)
 
+    def test_tolerant_mode_accepts_unsorted_dictionary(self):
+        value = bencode.decode(
+            b"d1:bi1e1:ai2ee",
+            max_depth=5,
+            max_items=20,
+            max_string_length=10,
+            require_sorted_keys=False,
+        )
+        self.assertEqual(value, {b"b": 1, b"a": 2})
+
+    def test_tolerant_mode_still_rejects_duplicate_dictionary_keys(self):
+        with self.assertRaises(bencode.BencodeError):
+            bencode.decode(
+                b"d1:ai1e1:ai2ee",
+                max_depth=5,
+                max_items=20,
+                max_string_length=10,
+                require_sorted_keys=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
