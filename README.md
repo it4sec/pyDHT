@@ -63,28 +63,37 @@ It observes and records what is already visible through the network.
 
 ## 3. How to use it
 
-Configure the sensor:
+pyDHT is **pre-configured by default** and can be started without changing the configuration.
 
-```text
-config.py
-```
-
-Start it:
+Start the sensor:
 
 ```bash
 python3 main.py
 ```
 
-Then analyze the collected information in:
+pyDHT will join the BitTorrent Mainline DHT, begin monitoring activity, discover nodes and infohashes, and store collected information automatically.
+
+Sample output:
+
+![pyDHT sample](images/sample.png)
+
+The main collected data is available in:
 
 ```text
 db/dht_network.jsonl
 db/pydht.sqlite3
 ```
 
-Use JSONL for DHT and network activity.
+Use:
 
-Use SQLite for discovered and validated torrent information.
+- **JSONL** for DHT and network activity
+- **SQLite** for discovered and validated torrent information
+
+For custom monitoring, resource limits, keyword detection, or notification settings, edit:
+
+```text
+config.py
+```
 
 ---
 
@@ -161,6 +170,8 @@ python3 main.py
 
 ## 6. Configuration
 
+pyDHT includes a default configuration suitable for initial operation.
+
 All user-adjustable configuration is located in:
 
 ```text
@@ -225,6 +236,9 @@ pyDHT/
 │   ├── pydht.sqlite3
 │   ├── dht_network.jsonl
 │   └── dht_routing.jsonl
+│
+├── images/
+│   └── sample.png
 │
 ├── tests/
 ├── README.md
